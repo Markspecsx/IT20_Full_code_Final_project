@@ -1,0 +1,10 @@
+0 Real Madrid
+1 Newcastle United
+2 Manchester United
+3 Manchester City
+4 Liverpool
+5 LAFC
+6 LA Galaxy
+7 Inter Miami
+8 Barcelona
+9 Arsenal

@@ -1,0 +1,1241 @@
+import 'dart:io';
+import 'dart:math';
+import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'tflite_helper.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'firebase_options.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:flutter/services.dart'; // For HapticFeedback
+import 'package:fl_chart/fl_chart.dart';
+import 'home_page.dart';
+import 'club_data.dart';
+import 'club_detail_sheet.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Image Recognition App',
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        primaryColor: Colors.grey[900],
+        scaffoldBackgroundColor: Colors.grey[900],
+        visualDensity: VisualDensity.adaptivePlatformDensity,
+        colorScheme: ColorScheme.fromSwatch(brightness: Brightness.dark).copyWith(secondary: Colors.grey[600]),
+      ),
+      home: const HomePage(), // Changed from CameraScreen to HomePage
+    );
+  }
+}
+
+// Helper function to update existing Firestore records
+Future<void> updateExistingRecordsToNotIdentified() async {
+  print('Starting to update existing records...');
+  
+  try {
+    final collection = FirebaseFirestore.instance.collection('Ellazo_FootballClubs_logs');
+    final snapshot = await collection.get();
+    
+    int totalRecords = snapshot.docs.length;
+    int updatedRecords = 0;
+    
+    print('Found $totalRecords total records');
+    
+    for (var doc in snapshot.docs) {
+      final data = doc.data();
+      final accuracyRate = data['Accuracy_Rate'] as num?;
+      final currentClassType = data['ClassType'] as String?;
+      
+      // Check if accuracy is below 85% and ClassType is not already "Not Identified"
+      if (accuracyRate != null && accuracyRate < 85 && currentClassType != 'Not Identified') {
+        await doc.reference.update({
+          'ClassType': 'Not Identified',
+        });
+        updatedRecords++;
+        print('Updated record ${doc.id}: $currentClassType (${accuracyRate.toStringAsFixed(1)}%) -> Not Identified');
+      }
+    }
+    
+    print('\n=== Update Complete ===');
+    print('Total records: $totalRecords');
+    print('Updated records: $updatedRecords');
+    print('Records unchanged: ${totalRecords - updatedRecords}');
+    
+  } catch (e) {
+    print('Error updating records: $e');
+    rethrow;
+  }
+}
+
+
+class CameraScreen extends StatefulWidget {
+  const CameraScreen({super.key});
+
+  @override
+  State<CameraScreen> createState() => _CameraScreenState();
+}
+
+class _CameraScreenState extends State<CameraScreen> with SingleTickerProviderStateMixin {
+  CameraController? _cameraController;
+  List<CameraDescription>? _cameras;
+  bool _isInitialized = false;
+  String _status = 'Initializing...';
+  final TFLiteHelper _tfliteHelper = TFLiteHelper();
+  bool _isModelLoaded = false;
+  AnimationController? _animationController;
+  bool _isFlashOn = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeApp();
+    _animationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 150),
+    );
+  }
+
+  Future<void> _initializeApp() async {
+    // Load model first
+    setState(() {
+      _status = 'Loading model...';
+    });
+
+    try {
+      await _tfliteHelper.loadModel();
+      setState(() {
+        _isModelLoaded = true;
+        _status = 'Model loaded. Initializing camera...';
+      });
+    } catch (e, s) {
+      setState(() {
+        _status = 'Error loading model: $e';
+      });
+      print('Error loading model: $e');
+      print('Stack trace: $s');
+      return;
+    }
+
+    // Then initialize camera
+    await _initializeCamera();
+  }
+
+  Future<void> _initializeCamera() async {
+    try {
+      final status = await Permission.camera.request();
+      if (status != PermissionStatus.granted) {
+        setState(() {
+          _status = 'Camera permission denied';
+        });
+        return;
+      }
+
+      _cameras = await availableCameras();
+      if (_cameras!.isEmpty) {
+        setState(() {
+          _status = 'No cameras found';
+        });
+        return;
+      }
+
+      _cameraController = CameraController(
+        _cameras![0],
+        ResolutionPreset.high,
+        enableAudio: false,
+      );
+
+      await _cameraController!.initialize();
+      
+      if (mounted) {
+        setState(() {
+          _isInitialized = true;
+          _status = 'Tap to scan';
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _status = 'Camera error: $e';
+      });
+    }
+  }
+
+  Future<void> _savePredictionToFirestore(List<Map<String, dynamic>> predictions, String imagePath) async {
+    if (predictions.isEmpty) { return; }
+    final topPrediction = predictions[0];
+    final double topConfidence = topPrediction['confidence'];
+    const primaryThreshold = 0.10; // Lowered from 0.90
+    if (topConfidence < primaryThreshold) { return; }
+    if (predictions.length > 1) {
+      final double secondConfidence = predictions[1]['confidence'];
+      if ((topConfidence - secondConfidence) < 0.05) { return; } // Lowered from 0.50
+    }
+
+    // Feature: Haptic Feedback for Success
+    HapticFeedback.heavyImpact();
+
+    // Feature: Upload Image to Firebase Storage
+    String imageUrl = '';
+    try {
+      final imageFile = File(imagePath);
+      final fileName = '${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final ref = FirebaseStorage.instance.ref().child('scan_logs').child(fileName);
+      final uploadTask = await ref.putFile(imageFile);
+      imageUrl = await uploadTask.ref.getDownloadURL();
+    } catch (e) {
+      print("Error uploading image: $e");
+    }
+
+    // Determine ClassType based on 85% confidence threshold
+    const confidenceThreshold = 0.85;
+    final String classType = topConfidence >= confidenceThreshold 
+        ? topPrediction['label'] 
+        : 'Not Identified';
+
+    try {
+      final collection = FirebaseFirestore.instance.collection('Ellazo_FootballClubs_logs');
+      await collection.add({
+        'ClassType': classType,
+        'Accuracy_Rate': (topConfidence * 100),
+        'Time': FieldValue.serverTimestamp(),
+        'ImageUrl': imageUrl, // <-- Save the image URL
+      });
+      print("SUCCESS: Prediction saved to Firestore.");
+    } catch (e) {
+      print("Error saving to Firestore: $e");
+    }
+  }
+
+  Future<void> _processImage(String imagePath) async {
+    setState(() => _status = 'Processing image...');
+    final imageFile = File(imagePath);
+    final predictions = _tfliteHelper.predictImage(imageFile);
+
+    if (predictions != null && predictions.isNotEmpty) {
+      await _savePredictionToFirestore(predictions, imagePath); // Pass path for upload
+    }
+
+    if (mounted && predictions != null) {
+      await Navigator.push(context, MaterialPageRoute(builder: (context) => ResultsScreen(imagePath: imagePath, predictions: predictions)));
+      setState(() => _status = 'Tap to scan');
+    }
+  }
+
+  Future<void> _takePicture() async {
+    // Feature: Animation
+    _animationController?.forward().then((_) => _animationController?.reverse());
+    if (!_isInitialized || !_isModelLoaded) return;
+    try {
+      final XFile image = await _cameraController!.takePicture();
+      _processImage(image.path);
+    } catch (e) {
+      // error handling
+    }
+  }
+
+  Future<void> _pickImageFromGallery() async {
+    // Feature: Animation
+    _animationController?.forward().then((_) => _animationController?.reverse());
+    if (!_isModelLoaded) return;
+    try {
+      final ImagePicker picker = ImagePicker();
+      final XFile? image = await picker.pickImage(source: ImageSource.gallery);
+      if (image == null) return;
+      _processImage(image.path);
+    } catch (e) {
+      // error handling
+    }
+  }
+
+  @override
+  void dispose() {
+    _cameraController?.dispose();
+    _animationController?.dispose(); // <-- Add this
+    _tfliteHelper.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Football Club Scanner'),
+        backgroundColor: Colors.grey[900],
+        elevation: 0,
+        actions: [
+          // Feature: Dashboard Button
+          IconButton(
+            icon: const Icon(Icons.dashboard, color: Colors.white),
+            onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => const DashboardScreen())),
+          ),
+          // Feature: History Button
+          IconButton(
+            icon: const Icon(Icons.history, color: Colors.white),
+            onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => const HistoryScreen())),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(24),
+                  child: _isInitialized && _isModelLoaded
+                      ? Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            CameraPreview(_cameraController!),
+                            // Feature: Flashlight Button
+                            Positioned(
+                              top: 10,
+                              right: 10,
+                              child: IconButton(
+                                icon: Icon(_isFlashOn ? Icons.flash_on : Icons.flash_off, color: Colors.white),
+                                onPressed: () {
+                                  setState(() => _isFlashOn = !_isFlashOn);
+                                  _cameraController!.setFlashMode(_isFlashOn ? FlashMode.torch : FlashMode.off);
+                                },
+                              ),
+                            )
+                          ],
+                        )
+                      : Container(
+                          color: Colors.grey[850],
+                          child: Center(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [ const CircularProgressIndicator(color: Colors.white), const SizedBox(height: 16), Text(_status) ],
+                            ),
+                          ),
+                        ),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(24, 30, 24, 10),
+              child: Column(
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      const SizedBox(width: 72), // Spacer
+                      // Feature: Shutter Animation
+                      ScaleTransition(
+                        scale: Tween<double>(begin: 1.0, end: 0.9).animate(_animationController!),
+                        child: GestureDetector(
+                          onTap: (_isInitialized && _isModelLoaded) ? _takePicture : null,
+                          child: Container(
+                            height: 72, width: 72,
+                            decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: Colors.white38, width: 3)),
+                            child: Center(child: Container(height: 60, width: 60, decoration: const BoxDecoration(shape: BoxShape.circle, color: Colors.white))),
+                          ),
+                        ),
+                      ),
+                      SizedBox(
+                        width: 72,
+                        child: IconButton(
+                          onPressed: _isModelLoaded ? _pickImageFromGallery : null,
+                          icon: const Icon(Icons.photo_library_outlined, color: Colors.white, size: 36),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 20),
+                  Text(_status, style: const TextStyle(color: Colors.white, fontSize: 16), textAlign: TextAlign.center),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class ResultsScreen extends StatelessWidget {
+  final String imagePath;
+  final List<Map<String, dynamic>> predictions;
+
+  const ResultsScreen({
+    super.key,
+    required this.imagePath,
+    required this.predictions,
+  });
+
+  Color _getDynamicColor(String label) {
+    // Simple hash to get a color from a string label
+    final int hash = label.hashCode;
+    final int r = (hash & 0xFF0000) >> 16;
+    final int g = (hash & 0x00FF00) >> 8;
+    final int b = hash & 0x0000FF;
+    return Color.fromARGB(255, r, g, b);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // --- NEW 85% THRESHOLD LOGIC ---
+    bool isPredictionConfident = false;
+    if (predictions.isNotEmpty) {
+      final double topConfidence = predictions[0]['confidence'];
+      
+      // Use 85% threshold (0.85)
+      const confidenceThreshold = 0.85;
+
+      if (topConfidence >= confidenceThreshold) {
+        isPredictionConfident = true;
+      }
+    }
+    // --- END OF NEW LOGIC ---
+
+    // Feature: Haptic Feedback for Failure
+    if (!isPredictionConfident) {
+      HapticFeedback.lightImpact();
+    }
+
+    final topPrediction = predictions.isNotEmpty ? predictions[0] : null;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Recognition Results'),
+        backgroundColor: Colors.grey[900],
+        foregroundColor: Colors.white,
+        elevation: 0,
+      ),
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(16),
+              child: Image.file(
+                File(imagePath),
+                height: 250,
+                fit: BoxFit.cover,
+              ),
+            ),
+          ),
+          if (topPrediction != null)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0),
+              child: _buildTopPredictionCard(context, topPrediction, isPredictionConfident), // Pass context
+            ),
+          const SizedBox(height: 24),
+          Expanded(
+            child: _buildConfidenceList(predictions),
+          ),
+          const SizedBox(height: 16),
+
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTopPredictionCard(
+      BuildContext context, Map<String, dynamic> topPrediction, bool isConfident) {
+    final double confidence = topPrediction['confidence'];
+    final String label = topPrediction['label'];
+    final Color breedColor = _getDynamicColor(label);
+
+    // Attempt to find matching club details
+    ClubDetail? matchedClub;
+    try {
+      matchedClub = clubData.firstWhere(
+        (club) => label.toLowerCase().contains(club.name.toLowerCase()),
+      );
+    } catch (e) {
+      matchedClub = null;
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Container(
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+            color: Colors.grey[850],
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: isConfident ? breedColor.withOpacity(0.7) : Colors.transparent,
+              width: 2,
+            ),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      isConfident ? label : 'Not Identified',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 28,
+                        fontWeight: FontWeight.bold,
+                      ),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      isConfident ? 'Top Match' : 'Not Identified (Low Confidence)',
+                      style: TextStyle(
+                        color: isConfident ? breedColor : Colors.orangeAccent,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    if (!isConfident) ...[
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Confidence is below 85%',
+                        style: TextStyle(
+                          color: Colors.grey,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(width: 20),
+              SizedBox(
+                width: 100,
+                height: 100,
+                child: CustomPaint(
+                  painter: ConfidenceRingPainter(
+                    confidence: confidence,
+                    backgroundColor: Colors.grey[800]!,
+                    foregroundColor: isConfident ? breedColor : Colors.orangeAccent,
+                  ),
+                  child: Center(
+                    child: Text(
+                      '${(confidence * 100).toStringAsFixed(1)}%',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 22,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        if (isConfident && matchedClub != null) ...[
+          const SizedBox(height: 16),
+          ElevatedButton.icon(
+            onPressed: () => ClubDetailSheet.show(context, matchedClub!),
+            icon: const Icon(Icons.info_outline),
+            label: const Text('VIEW FULL ANALYSIS'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF8B1E2D), // Primary Red
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+
+  Widget _buildConfidenceList(List<Map<String, dynamic>> predictions) {
+    const confidenceThreshold = 0.85;
+    
+    // Separate predictions into identified (>=85%) and not identified (<85%)
+    final identifiedPredictions = predictions.where((p) => p['confidence'] >= confidenceThreshold).toList();
+    final notIdentifiedPredictions = predictions.where((p) => p['confidence'] < confidenceThreshold).toList();
+    
+    // Take only top 10 identified predictions
+    final top10Identified = identifiedPredictions.take(10).toList();
+
+    return ListView(
+      padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+      children: [
+        // Top 10 Identified Section
+        if (top10Identified.isNotEmpty) ...[
+          ...top10Identified.map((prediction) {
+            final String label = prediction['label'];
+            final double confidence = prediction['confidence'];
+            final Color breedColor = _getDynamicColor(label);
+
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4.0),
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.grey[850],
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 12,
+                      height: 12,
+                      decoration: BoxDecoration(
+                        color: breedColor,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: Text(
+                        label,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 16,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(width: 16),
+                    Text(
+                      '${(confidence * 100).toStringAsFixed(1)}%',
+                      style: TextStyle(
+                        color: Colors.white.withOpacity(0.8),
+                        fontSize: 16,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }).toList(),
+        ],
+        
+        // Not Identified Section
+        if (notIdentifiedPredictions.isNotEmpty) ...[
+          const SizedBox(height: 16),
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 8.0),
+            child: Text(
+              'Not Identified',
+              style: TextStyle(
+                color: Colors.orangeAccent,
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+          ...notIdentifiedPredictions.map((prediction) {
+            final String label = prediction['label'];
+            final double confidence = prediction['confidence'];
+
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4.0),
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.grey[850],
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: Colors.orangeAccent.withOpacity(0.3),
+                    width: 1,
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 12,
+                      height: 12,
+                      decoration: const BoxDecoration(
+                        color: Colors.orangeAccent,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: Text(
+                        label,
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.6),
+                          fontSize: 16,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(width: 16),
+                    Text(
+                      '${(confidence * 100).toStringAsFixed(1)}%',
+                      style: TextStyle(
+                        color: Colors.orangeAccent.withOpacity(0.8),
+                        fontSize: 16,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }).toList(),
+        ],
+      ],
+    );
+  }
+}
+
+class ConfidenceRingPainter extends CustomPainter {
+  final double confidence;
+  final Color backgroundColor;
+  final Color foregroundColor;
+
+  ConfidenceRingPainter({
+    required this.confidence,
+    required this.backgroundColor,
+    required this.foregroundColor,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = min(size.width, size.height) / 2;
+    const strokeWidth = 10.0;
+
+    final backgroundPaint = Paint()
+      ..color = backgroundColor
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth;
+    canvas.drawCircle(center, radius, backgroundPaint);
+
+    final foregroundPaint = Paint()
+      ..color = foregroundColor
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth
+      ..strokeCap = StrokeCap.round;
+
+    const startAngle = -pi / 2;
+    final sweepAngle = 2 * pi * confidence;
+
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: radius),
+      startAngle,
+      sweepAngle,
+      false,
+      foregroundPaint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) {
+    return false;
+  }
+}
+
+class HistoryScreen extends StatelessWidget {
+  const HistoryScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Scan History'), backgroundColor: Colors.grey[900]),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance.collection('Ellazo_FootballClubs_logs').orderBy('Time', descending: true).snapshots(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) { return const Center(child: CircularProgressIndicator()); }
+          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) { return const Center(child: Text('No scan history found.')); }
+          final documents = snapshot.data!.docs;
+          return ListView.builder(
+            itemCount: documents.length,
+            itemBuilder: (context, index) {
+              final data = documents[index].data() as Map<String, dynamic>;
+              final imageUrl = data['ImageUrl'] as String?;
+              final timestamp = data['Time'] as Timestamp?;
+              final classType = data['ClassType'] ?? 'Unknown Class';
+              final accuracyRate = data['Accuracy_Rate'] as num?;
+              final isNotIdentified = classType == 'Not Identified';
+              
+              return Card(
+                color: Colors.grey[850],
+                margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                child: ListTile(
+                  leading: (imageUrl != null && imageUrl.isNotEmpty) 
+                      ? CircleAvatar(backgroundImage: NetworkImage(imageUrl)) 
+                      : const CircleAvatar(child: Icon(Icons.image_not_supported)),
+                  title: Text(
+                    classType,
+                    style: TextStyle(
+                      color: isNotIdentified ? Colors.orangeAccent : Colors.white,
+                      fontWeight: isNotIdentified ? FontWeight.w500 : FontWeight.normal,
+                    ),
+                  ),
+                  subtitle: Text(timestamp != null ? 'Scanned on: ${timestamp.toDate().toLocal()}' : 'No date'),
+                  trailing: Text(
+                    '${accuracyRate?.toStringAsFixed(0) ?? '0'}%',
+                    style: TextStyle(
+                      color: isNotIdentified ? Colors.orangeAccent : Colors.white,
+                    ),
+                  ),
+                  onTap: () => Navigator.push(context, MaterialPageRoute(builder: (context) => ScanDetailScreen(data: data))),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+class ScanDetailScreen extends StatelessWidget {
+  final Map<String, dynamic> data;
+  const ScanDetailScreen({super.key, required this.data});
+
+  @override
+  Widget build(BuildContext context) {
+    final imageUrl = data['ImageUrl'] as String?;
+    final classType = data['ClassType'] as String?;
+    final accuracy = data['Accuracy_Rate'] as num?;
+    final time = (data['Time'] as Timestamp?)?.toDate();
+    final isNotIdentified = classType == 'Not Identified';
+
+    return Scaffold(
+      appBar: AppBar(title: Text(classType ?? 'Scan Details'), backgroundColor: Colors.grey[900]),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (imageUrl != null && imageUrl.isNotEmpty)
+              ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: Image.network(
+                  imageUrl,
+                  fit: BoxFit.cover,
+                  width: double.infinity,
+                  loadingBuilder: (context, child, progress) => progress == null ? child : const Center(child: CircularProgressIndicator()),
+                  errorBuilder: (context, error, stackTrace) => const AspectRatio(aspectRatio: 1, child: Center(child: Icon(Icons.error))),
+                ),
+              ),
+            const SizedBox(height: 24),
+            Text(
+              isNotIdentified ? 'Status' : 'Identified Club',
+              style: TextStyle(color: Colors.grey[400]),
+            ),
+            Text(
+              classType ?? 'N/A',
+              style: TextStyle(
+                fontSize: 28,
+                fontWeight: FontWeight.bold,
+                color: isNotIdentified ? Colors.orangeAccent : Colors.white,
+              ),
+            ),
+            const SizedBox(height: 24),
+            Text('Confidence Score', style: TextStyle(color: Colors.grey[400])),
+            Text(
+              '${accuracy?.toStringAsFixed(1) ?? '0'}%',
+              style: TextStyle(
+                fontSize: 28,
+                fontWeight: FontWeight.bold,
+                color: isNotIdentified ? Colors.orangeAccent : Colors.white,
+              ),
+            ),
+            const SizedBox(height: 24),
+            Text('Scan Date', style: TextStyle(color: Colors.grey[400])),
+            Text(time?.toLocal().toString() ?? 'N/A', style: const TextStyle(fontSize: 18)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class DashboardScreen extends StatefulWidget {
+  const DashboardScreen({super.key});
+
+  @override
+  State<DashboardScreen> createState() => _DashboardScreenState();
+}
+
+class _DashboardScreenState extends State<DashboardScreen> {
+  String _selectedTimeRange = '7 days';
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+        appBar: AppBar(
+          title: const Text('Dashboard'),
+          backgroundColor: Colors.grey[900],
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.update, color: Colors.white),
+              tooltip: 'Update Database Records',
+              onPressed: () async {
+                // Show confirmation dialog
+                final confirm = await showDialog<bool>(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('Update Database'),
+                    content: const Text(
+                      'This will update all existing records with confidence below 85% to "Not Identified". Continue?',
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context, false),
+                        child: const Text('Cancel'),
+                      ),
+                      TextButton(
+                        onPressed: () => Navigator.pop(context, true),
+                        child: const Text('Update'),
+                      ),
+                    ],
+                  ),
+                );
+
+                if (confirm == true && context.mounted) {
+                  // Show loading indicator
+                  showDialog(
+                    context: context,
+                    barrierDismissible: false,
+                    builder: (context) => const Center(
+                      child: CircularProgressIndicator(),
+                    ),
+                  );
+
+                  try {
+                    await updateExistingRecordsToNotIdentified();
+                    if (context.mounted) {
+                      Navigator.pop(context); // Close loading
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('Database update complete!'),
+                          backgroundColor: Colors.green,
+                        ),
+                      );
+                    }
+                  } catch (e) {
+                    if (context.mounted) {
+                      Navigator.pop(context); // Close loading
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('Error: $e'),
+                          backgroundColor: Colors.red,
+                        ),
+                      );
+                    }
+                  }
+                }
+              },
+            ),
+          ],
+        ),
+        backgroundColor: Colors.grey[850],
+        body: StreamBuilder<QuerySnapshot>(
+          stream: FirebaseFirestore.instance
+              .collection('Ellazo_FootballClubs_logs')
+              .orderBy('Time', descending: true)
+              .snapshots(),
+          builder: (context, snapshot) {
+            if (snapshot.connectionState == ConnectionState.waiting) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+              return const Center(child: Text('No scan history to display.'));
+            }
+
+            final documents = snapshot.data!.docs;
+
+            // Prepare data for line chart - group by date
+            final Map<String, Map<String, int>> timeSeriesData = {};
+            final Set<String> allClassTypes = {};
+
+            for (var doc in documents) {
+              final data = doc.data() as Map<String, dynamic>;
+              final classType = data['ClassType'] as String? ?? 'Unknown';
+              final timestamp = data['Time'] as Timestamp?;
+
+              if (timestamp != null) {
+                final date = timestamp.toDate();
+                final dateKey =
+                    '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+
+                if (!timeSeriesData.containsKey(dateKey)) {
+                  timeSeriesData[dateKey] = {};
+                }
+
+                timeSeriesData[dateKey]![classType] =
+                    (timeSeriesData[dateKey]![classType] ?? 0) + 1;
+                allClassTypes.add(classType);
+              }
+            }
+
+            // Sort dates
+            final sortedDates = timeSeriesData.keys.toList()..sort();
+
+            // Filter by selected time range
+            final now = DateTime.now();
+            final filteredDates = sortedDates.where((dateStr) {
+              final date = DateTime.parse(dateStr);
+              final daysDiff = now.difference(date).inDays;
+
+              switch (_selectedTimeRange) {
+                case '7 days':
+                  return daysDiff <= 7;
+                case '30 days':
+                  return daysDiff <= 30;
+                case 'All time':
+                default:
+                  return true;
+              }
+            }).toList();
+
+            final List<Color> chartColors = [
+              Colors.cyan,
+              Colors.blue,
+              Colors.indigo,
+              Colors.purple,
+              Colors.pink,
+            ];
+
+            final classTypesList = allClassTypes.toList();
+            final List<LineChartBarData> lineBarsData = [];
+            for (int i = 0; i < classTypesList.length; i++) {
+              final classType = classTypesList[i];
+              final color = classType == 'Not Identified' 
+                  ? Colors.orangeAccent 
+                  : chartColors[i % chartColors.length];
+
+              final spots = <FlSpot>[];
+              for (int j = 0; j < filteredDates.length; j++) {
+                final dateKey = filteredDates[j];
+                final count = timeSeriesData[dateKey]?[classType] ?? 0;
+                spots.add(FlSpot(j.toDouble(), count.toDouble()));
+              }
+
+              lineBarsData.add(
+                LineChartBarData(
+                  spots: spots,
+                  isCurved: true,
+                  color: color,
+                  barWidth: 3,
+                  isStrokeCapRound: true,
+                  dotData: const FlDotData(show: true),
+                  belowBarData: BarAreaData(
+                    show: true,
+                    color: color.withValues(alpha: 0.1),
+                  ),
+                ),
+              );
+            }
+
+            return SingleChildScrollView(
+              padding: const EdgeInsets.all(24.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('Scan Trends', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+                      DropdownButton<String>(
+                        value: _selectedTimeRange,
+                        dropdownColor: Colors.grey[800],
+                        items: ['7 days', '30 days', 'All time'].map((String value) {
+                          return DropdownMenuItem<String>(
+                            value: value,
+                            child: Text(value, style: const TextStyle(color: Colors.white)),
+                          );
+                        }).toList(),
+                        onChanged: (String? newValue) {
+                          if (newValue != null) {
+                            setState(() {
+                              _selectedTimeRange = newValue;
+                            });
+                          }
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 24),
+                  if (filteredDates.isNotEmpty) ...[
+                    SizedBox(
+                      height: 250,
+                      child: LineChart(
+                        LineChartData(
+                          gridData: FlGridData(
+                            show: true,
+                            drawVerticalLine: true,
+                            horizontalInterval: 1,
+                            verticalInterval: 1,
+                            getDrawingHorizontalLine: (value) {
+                              return FlLine(
+                                color: Colors.grey[700]!,
+                                strokeWidth: 0.5,
+                              );
+                            },
+                            getDrawingVerticalLine: (value) {
+                              return FlLine(
+                                color: Colors.grey[700]!,
+                                strokeWidth: 0.5,
+                              );
+                            },
+                          ),
+                          titlesData: FlTitlesData(
+                            show: true,
+                            rightTitles: const AxisTitles(
+                              sideTitles: SideTitles(showTitles: false),
+                            ),
+                            topTitles: const AxisTitles(
+                              sideTitles: SideTitles(showTitles: false),
+                            ),
+                            bottomTitles: AxisTitles(
+                              sideTitles: SideTitles(
+                                showTitles: true,
+                                reservedSize: 30,
+                                interval: 1,
+                                getTitlesWidget: (double value, TitleMeta meta) {
+                                  final index = value.toInt();
+                                  if (index >= 0 && index < filteredDates.length) {
+                                    final date = DateTime.parse(filteredDates[index]);
+                                    return SideTitleWidget(
+                                      axisSide: meta.axisSide,
+                                      child: Text(
+                                        '${date.month}/${date.day}',
+                                        style: const TextStyle(color: Colors.white70, fontSize: 10),
+                                      ),
+                                    );
+                                  }
+                                  return const Text('');
+                                },
+                              ),
+                            ),
+                            leftTitles: AxisTitles(
+                              sideTitles: SideTitles(
+                                showTitles: true,
+                                interval: 1,
+                                getTitlesWidget: (double value, TitleMeta meta) {
+                                  return Text(
+                                    value.toInt().toString(),
+                                    style: const TextStyle(color: Colors.white70, fontSize: 10),
+                                  );
+                                },
+                                reservedSize: 32,
+                              ),
+                            ),
+                          ),
+                          borderData: FlBorderData(
+                            show: true,
+                            border: Border.all(color: Colors.grey[700]!),
+                          ),
+                          minX: 0,
+                          maxX: (filteredDates.length - 1).toDouble(),
+                          minY: 0,
+                          lineBarsData: lineBarsData,
+                          lineTouchData: LineTouchData(
+                            enabled: true,
+                            touchTooltipData: LineTouchTooltipData(
+                              getTooltipItems: (List<LineBarSpot> touchedBarSpots) {
+                                return touchedBarSpots.map((barSpot) {
+                                  final classType = classTypesList[barSpot.barIndex];
+                                  return LineTooltipItem(
+                                    '$classType\n${barSpot.y.toInt()} scans',
+                                    const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                                  );
+                                }).toList();
+                              },
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                    Wrap(
+                      spacing: 16,
+                      runSpacing: 8,
+                      children: classTypesList.asMap().entries.map((entry) {
+                        final index = entry.key;
+                        final classType = entry.value;
+                        final color = classType == 'Not Identified' 
+                            ? Colors.orangeAccent 
+                            : chartColors[index % chartColors.length];
+                        return Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              width: 16,
+                              height: 16,
+                              decoration: BoxDecoration(
+                                color: color,
+                                shape: BoxShape.circle,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              classType,
+                              style: const TextStyle(color: Colors.white, fontSize: 14),
+                            ),
+                          ],
+                        );
+                      }).toList(),
+                    ),
+                  ] else ...[
+                    const Center(
+                      child: Padding(
+                        padding: EdgeInsets.all(32.0),
+                        child: Text(
+                          'No data available for selected time range',
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 32),
+                  const Text('Recent Scans', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 16),
+                  ListView.builder(
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    itemCount: documents.length > 5 ? 5 : documents.length,
+                    itemBuilder: (context, index) {
+                      final data = documents[index].data() as Map<String, dynamic>;
+                      final classType = data['ClassType'] ?? 'Unknown';
+                      final isNotIdentified = classType == 'Not Identified';
+                      
+                      return Card(
+                        color: Colors.grey[850],
+                        child: ListTile(
+                          title: Text(
+                            classType,
+                            style: TextStyle(
+                              color: isNotIdentified ? Colors.orangeAccent : Colors.white,
+                            ),
+                          ),
+                          trailing: Text(
+                            '${(data['Accuracy_Rate'] as num?)?.toStringAsFixed(0) ?? '0'}%',
+                            style: TextStyle(
+                              color: isNotIdentified ? Colors.orangeAccent : Colors.white,
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ],
+              ),
+            );
+          },
+        ));
+  }
+
+}
