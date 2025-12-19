@@ -26,6 +26,8 @@ Complete Flutter source code including all Dart files, screens, and configuratio
 
 Includes TensorFlow Lite model, screenshots, training data, and all project assets used for football club recognition.
 
+https://github.com/Markspecsx/Ellazo_Football_club_Classification_FinalProject/tree/main
+
 ## ✨ Features
 
 ### 📸 Real-Time Scanning  
